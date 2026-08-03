@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: zapvenda30d
+    runtime: static
+    buildCommand: ""
+    staticPublishPath: .
