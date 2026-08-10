@@ -1,7 +1,10 @@
 import json
 import os
 import re
+import unicodedata
 from functools import wraps
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, redirect, request, send_from_directory, session
 from google import genai
@@ -29,6 +32,157 @@ Regras obrigatórias:
 - Priorize ofertas simples, objetivas e fáceis de entregar digitalmente.
 """.strip()
 
+OSM_USER_AGENT = "ZapVendaAgent/0.2 (public-business-discovery)"
+
+NICHE_RULES = {
+    "barbearia": (["[\"shop\"=\"hairdresser\"]"], "Barbearia"),
+    "barbeiro": (["[\"shop\"=\"hairdresser\"]"], "Barbearia"),
+    "salao": (["[\"shop\"=\"hairdresser\"]", "[\"shop\"=\"beauty\"]"], "Salão de beleza"),
+    "salao de beleza": (["[\"shop\"=\"hairdresser\"]", "[\"shop\"=\"beauty\"]"], "Salão de beleza"),
+    "manicure": (["[\"shop\"=\"beauty\"][\"beauty\"=\"nails\"]", "[\"shop\"=\"beauty\"]"], "Beleza / unhas"),
+    "pizzaria": (["[\"amenity\"=\"restaurant\"][\"cuisine\"~\"pizza\",i]", "[\"amenity\"=\"fast_food\"][\"cuisine\"~\"pizza\",i]"], "Pizzaria"),
+    "restaurante": (["[\"amenity\"=\"restaurant\"]"], "Restaurante"),
+    "lanchonete": (["[\"amenity\"=\"fast_food\"]", "[\"amenity\"=\"cafe\"]"], "Lanchonete / café"),
+    "cafeteria": (["[\"amenity\"=\"cafe\"]"], "Cafeteria"),
+    "padaria": (["[\"shop\"=\"bakery\"]"], "Padaria"),
+    "oficina": (["[\"shop\"=\"car_repair\"]"], "Oficina mecânica"),
+    "oficina mecanica": (["[\"shop\"=\"car_repair\"]"], "Oficina mecânica"),
+    "mecanica": (["[\"shop\"=\"car_repair\"]"], "Oficina mecânica"),
+    "pet shop": (["[\"shop\"=\"pet\"]"], "Pet shop"),
+    "petshop": (["[\"shop\"=\"pet\"]"], "Pet shop"),
+    "academia": (["[\"leisure\"=\"fitness_centre\"]"], "Academia"),
+    "dentista": (["[\"amenity\"=\"dentist\"]"], "Dentista"),
+    "clinica": (["[\"amenity\"=\"clinic\"]"], "Clínica"),
+    "farmacia": (["[\"amenity\"=\"pharmacy\"]"], "Farmácia"),
+    "loja de roupas": (["[\"shop\"=\"clothes\"]"], "Loja de roupas"),
+    "roupas": (["[\"shop\"=\"clothes\"]"], "Loja de roupas"),
+    "eletricista": (["[\"craft\"=\"electrician\"]"], "Eletricista"),
+    "encanador": (["[\"craft\"=\"plumber\"]"], "Encanador"),
+    "pintor": (["[\"craft\"=\"painter\"]"], "Pintor"),
+}
+
+
+def normalize_text(value):
+    value = unicodedata.normalize("NFD", str(value or "").lower().strip())
+    return "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
+
+
+def http_json(url, data=None, timeout=20):
+    headers = {"User-Agent": OSM_USER_AGENT, "Accept": "application/json"}
+    if data is None:
+        req = Request(url, headers=headers)
+    else:
+        body = urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def geocode_city(city):
+    params = urlencode({"q": city, "format": "jsonv2", "limit": 1, "countrycodes": "br"})
+    results = http_json(f"https://nominatim.openstreetmap.org/search?{params}")
+    if not results:
+        raise RuntimeError("Não consegui localizar essa cidade. Tente informar cidade e estado, por exemplo: Rio de Janeiro, RJ.")
+    bbox = results[0].get("boundingbox") or []
+    if len(bbox) != 4:
+        raise RuntimeError("A cidade foi encontrada, mas sem área geográfica utilizável.")
+    south, north, west, east = bbox
+    return float(south), float(west), float(north), float(east)
+
+
+def osm_rule_for_niche(niche):
+    key = normalize_text(niche)
+    if key in NICHE_RULES:
+        return NICHE_RULES[key]
+    for candidate, rule in NICHE_RULES.items():
+        if candidate in key or key in candidate:
+            return rule
+    supported = "barbearia, salão, pizzaria, restaurante, lanchonete, padaria, oficina, pet shop, academia, dentista, clínica, farmácia, roupas, eletricista, encanador ou pintor"
+    raise RuntimeError(f"Esse nicho ainda não está mapeado na busca gratuita. Por enquanto tente: {supported}.")
+
+
+def osm_discover(niche, city, count):
+    filters, segment = osm_rule_for_niche(niche)
+    south, west, north, east = geocode_city(city)
+    bbox = f"{south},{west},{north},{east}"
+    selectors = []
+    for filter_text in filters:
+        selectors.append(f"nwr{filter_text}[\"name\"]({bbox});")
+    query = "[out:json][timeout:20];(" + "".join(selectors) + ");out center tags 60;"
+    payload = http_json("https://overpass-api.de/api/interpreter", {"data": query}, timeout=30)
+    elements = payload.get("elements", [])
+
+    leads = []
+    seen = set()
+    for element in elements:
+        tags = element.get("tags") or {}
+        name = str(tags.get("name") or "").strip()
+        if not name or normalize_text(name) in seen:
+            continue
+        seen.add(normalize_text(name))
+
+        website = str(tags.get("contact:website") or tags.get("website") or "").strip()
+        phone = str(tags.get("contact:phone") or tags.get("phone") or "").strip()
+        instagram = str(tags.get("contact:instagram") or tags.get("instagram") or "").strip()
+        facebook = str(tags.get("contact:facebook") or tags.get("facebook") or "").strip()
+        opening_hours = str(tags.get("opening_hours") or "").strip()
+        street = str(tags.get("addr:street") or "").strip()
+        house = str(tags.get("addr:housenumber") or "").strip()
+        address = " ".join(part for part in [street, house] if part).strip()
+        osm_type = element.get("type", "node")
+        osm_id = element.get("id", "")
+        osm_url = f"https://www.openstreetmap.org/{osm_type}/{osm_id}" if osm_id else "https://www.openstreetmap.org"
+        public_url = website or instagram or facebook or osm_url
+
+        public_fields = []
+        if website:
+            public_fields.append("site")
+        if phone:
+            public_fields.append("telefone")
+        if instagram:
+            public_fields.append("Instagram")
+        if facebook:
+            public_fields.append("Facebook")
+        if opening_hours:
+            public_fields.append("horário")
+
+        if not website and not instagram and not facebook:
+            signal = "No cadastro público consultado, não há site ou rede social informados. Isso não significa que o negócio não possua esses canais."
+            opportunity = "Oferecer um pacote simples de presença digital e conteúdo para facilitar apresentação e contato online."
+        elif not website:
+            signal = f"O cadastro público informa {', '.join(public_fields) or 'dados de contato'}, mas não traz site."
+            opportunity = "Oferecer uma página simples de apresentação, bio comercial e conteúdo para redes sociais."
+        else:
+            signal = f"O cadastro público possui {', '.join(public_fields)}."
+            opportunity = "Oferecer uma revisão da comunicação comercial e um pacote de conteúdo pronto para divulgação."
+
+        offer = "Pacote Comercial Express: bio/posicionamento, 5 conteúdos, 5 legendas e mensagens de WhatsApp personalizadas."
+        first_message = (
+            f"Olá! Encontrei o {name} em um cadastro público de negócios de {city}. "
+            "Trabalho com materiais digitais simples para pequenos negócios e preparei uma ideia de divulgação que pode ser adaptada para vocês. "
+            "Posso te mandar uma amostra sem compromisso?"
+        )
+
+        leads.append({
+            "name": name,
+            "segment": segment,
+            "city": city,
+            "public_url": public_url,
+            "public_phone": phone,
+            "public_instagram": instagram,
+            "address": address,
+            "signal": signal,
+            "opportunity": opportunity,
+            "offer": offer,
+            "first_message": first_message,
+            "source": "OpenStreetMap",
+        })
+        if len(leads) >= count:
+            break
+
+    return leads
+
 
 def ai_client():
     if not GEMINI_API_KEY:
@@ -49,7 +203,6 @@ def protected(view):
                 return jsonify({"ok": False, "error": "Sessão expirada. Entre novamente."}), 401
             return redirect("/entrar")
         return view(*args, **kwargs)
-
     return wrapper
 
 
@@ -69,53 +222,32 @@ def extract_json(text):
     last_array = text.rfind("]")
     if first_array >= 0 and last_array > first_array:
         try:
-            return json.loads(text[first_array : last_array + 1])
+            return json.loads(text[first_array:last_array + 1])
         except Exception:
             pass
     first_obj = text.find("{")
     last_obj = text.rfind("}")
     if first_obj >= 0 and last_obj > first_obj:
         try:
-            return json.loads(text[first_obj : last_obj + 1])
+            return json.loads(text[first_obj:last_obj + 1])
         except Exception:
             pass
     return {"text": text}
 
 
-def grounding_sources(response):
-    sources = []
-    try:
-        metadata = response.candidates[0].grounding_metadata
-        chunks = metadata.grounding_chunks or []
-        seen = set()
-        for chunk in chunks:
-            web = getattr(chunk, "web", None)
-            if not web:
-                continue
-            uri = getattr(web, "uri", None)
-            title = getattr(web, "title", None)
-            if uri and uri not in seen:
-                sources.append({"title": title or uri, "url": uri})
-                seen.add(uri)
-    except Exception:
-        pass
-    return sources[:12]
-
-
-def run_ai(prompt, use_search=False):
-    config_kwargs = {"system_instruction": SYSTEM_RULES}
-    if use_search:
-        config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-
+def run_ai(prompt):
     client = ai_client()
     try:
         return client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
-            config=types.GenerateContentConfig(**config_kwargs),
+            config=types.GenerateContentConfig(system_instruction=SYSTEM_RULES),
         )
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception:
+            pass
 
 
 @app.get("/")
@@ -152,14 +284,13 @@ def agent_page():
 @app.get("/api/status")
 @protected
 def api_status():
-    return jsonify(
-        {
-            "ok": True,
-            "model": GEMINI_MODEL,
-            "gemini_configured": bool(GEMINI_API_KEY),
-            "mode": "aprovação humana",
-        }
-    )
+    return jsonify({
+        "ok": True,
+        "model": GEMINI_MODEL,
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "mode": "aprovação humana",
+        "prospecting_source": "OpenStreetMap/Overpass",
+    })
 
 
 @app.post("/api/prospect")
@@ -168,31 +299,21 @@ def api_prospect():
     data = request.get_json(silent=True) or {}
     niche = str(data.get("niche", "")).strip()
     city = str(data.get("city", "")).strip()
-    count = max(1, min(int(data.get("count", 5) or 5), 10))
+    try:
+        count = max(1, min(int(data.get("count", 5) or 5), 10))
+    except Exception:
+        count = 5
     if not niche or not city:
         return jsonify({"ok": False, "error": "Informe nicho e cidade."}), 400
-
-    prompt = f"""
-Pesquise na web e encontre até {count} negócios REAIS do nicho "{niche}" em "{city}" que possam se beneficiar de melhoria simples em divulgação digital.
-Priorize negócios com presença pública verificável e algum sinal concreto de oportunidade (ex.: site simples, rede social pouco clara, comunicação sem CTA, cardápio/serviço mal apresentado). Não invente defeitos.
-
-Retorne SOMENTE um JSON válido no formato:
-{{"leads":[{{
-  "name":"nome público do negócio",
-  "segment":"segmento",
-  "city":"cidade",
-  "public_url":"URL pública verificada ou string vazia",
-  "signal":"sinal público observado, em uma frase",
-  "opportunity":"o que podemos melhorar sem prometer resultado",
-  "offer":"uma oferta digital simples adequada ao caso",
-  "first_message":"mensagem curta, individual e respeitosa de primeira abordagem"
-}}]}}
-""".strip()
     try:
-        response = run_ai(prompt, use_search=True)
-        parsed = extract_json(response.text)
-        leads = parsed.get("leads", []) if isinstance(parsed, dict) else []
-        return jsonify({"ok": True, "leads": leads[:count], "sources": grounding_sources(response)})
+        leads = osm_discover(niche, city, count)
+        if not leads:
+            return jsonify({"ok": False, "error": "Não encontrei negócios suficientes nesse cadastro público. Tente outro nicho, cidade ou bairro."}), 404
+        return jsonify({
+            "ok": True,
+            "leads": leads,
+            "sources": [{"title": "OpenStreetMap", "url": "https://www.openstreetmap.org"}],
+        })
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
@@ -208,12 +329,12 @@ def api_ai():
 
     prompts = {
         "qualify": """
-Analise este prospecto e retorne SOMENTE JSON com: score (0-100), reasons (array de 2 a 4 itens), best_offer, risk, next_step. O score mede aderência a um serviço digital simples e chance de haver uma dor clara, não riqueza nem valor humano.
+Analise este prospecto e retorne SOMENTE JSON com: score (0-100), reasons (array de 2 a 4 itens), best_offer, risk, next_step. O score mede aderência a um serviço digital simples e chance de haver uma dor clara, não riqueza nem valor humano. Diferencie claramente fatos públicos de inferências.
 CONTEXTO:
 {context}
 """,
         "outreach": """
-Crie UMA mensagem inicial curta para este prospecto. Comece pelo que foi observado publicamente, mostre uma oportunidade específica e ofereça uma pequena amostra ou ideia sem compromisso. Evite elogio genérico e não diga que analisou dados privados. Retorne apenas a mensagem.
+Crie UMA mensagem inicial curta para este prospecto. Use somente fatos presentes no contexto. Mostre uma oportunidade específica e ofereça uma pequena amostra ou ideia sem compromisso. Evite elogio genérico e não diga que analisou dados privados. Retorne apenas a mensagem.
 CONTEXTO:
 {context}
 """,
@@ -257,7 +378,10 @@ CONTEXTO:
         result = extract_json(response.text) if action in {"qualify", "offer", "brief"} else response.text.strip()
         return jsonify({"ok": True, "result": result})
     except Exception as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 500
+        message = str(exc)
+        if "RESOURCE_EXHAUSTED" in message or "429" in message:
+            message = "A cota gratuita da IA atingiu o limite temporário. Aguarde alguns minutos e tente novamente. A busca de empresas continua gratuita e não usa a cota da Gemini."
+        return jsonify({"ok": False, "error": message}), 500
 
 
 @app.get("/<path:filename>")
