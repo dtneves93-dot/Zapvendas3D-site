@@ -4,7 +4,7 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    startCommand: gunicorn --timeout 60 server:app
     envVars:
       - key: GEMINI_MODEL
         value: gemini-3.1-flash-lite
