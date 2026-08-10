@@ -1,6 +1,9 @@
+import html
 import json
+import re
 import unicodedata
-from urllib.parse import urlencode
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from flask import jsonify, request
@@ -24,6 +27,47 @@ GENERIC_NAMES = {
     "loja de roupas", "roupas", "eletricista", "encanador", "pintor",
 }
 
+BAD_TITLE_PREFIXES = (
+    "melhores ", "os melhores ", "onde comer", "lista de ", "guia de ",
+    "pizzaria em ", "pizzarias em ", "barbearia em ", "barbearias em ",
+    "restaurantes em ", "salões em ", "saloes em ", "encontre ",
+)
+
+PLATFORM_WORDS = (
+    "instagram", "facebook", "ifood", "tripadvisor", "foursquare",
+    "guiamais", "telelistas", "apontador", "waze", "google maps",
+)
+
+
+class _LinkParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self._href = None
+        self._classes = ""
+        self._text = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "a":
+            return
+        data = dict(attrs)
+        self._href = data.get("href")
+        self._classes = data.get("class", "")
+        self._text = []
+
+    def handle_data(self, data):
+        if self._href is not None:
+            self._text.append(data)
+
+    def handle_endtag(self, tag):
+        if tag.lower() == "a" and self._href is not None:
+            text = html.unescape("".join(self._text)).strip()
+            if text:
+                self.links.append((self._href, text, self._classes))
+            self._href = None
+            self._classes = ""
+            self._text = []
+
 
 def _norm(value):
     value = unicodedata.normalize("NFD", str(value or "").lower().strip())
@@ -35,7 +79,9 @@ def _useful_name(name, niche, segment):
     if not normalized or len(normalized) < 3:
         return False
     blocked = GENERIC_NAMES | {_norm(niche), _norm(segment)}
-    return normalized not in blocked
+    if normalized in blocked:
+        return False
+    return not any(normalized.startswith(prefix) for prefix in BAD_TITLE_PREFIXES)
 
 
 def _http_json(url, data=None, timeout=6):
@@ -55,9 +101,24 @@ def _http_json(url, data=None, timeout=6):
     return json.loads(raw)
 
 
+def _http_text(url, data=None, timeout=7):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/124 Mobile Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.7",
+    }
+    if data is None:
+        req = Request(url, headers=headers)
+    else:
+        body = urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = Request(url, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
 def _location_query(city):
     text = str(city or "").strip()
-    # Permite "Rio de Janeiro, RJ - Vila Valqueire" e prioriza o bairro.
     if " - " in text:
         main_city, locality = [part.strip() for part in text.split(" - ", 1)]
         if main_city and locality:
@@ -138,7 +199,7 @@ def _lead(name, segment, city, tags, osm_type="node", osm_id="", source="OpenStr
         "signal": signal,
         "opportunity": opportunity,
         "offer": "Pacote Comercial Express: bio/posicionamento, 5 conteúdos, 5 legendas e mensagens de WhatsApp personalizadas.",
-        "first_message": f"Olá! Encontrei o {name} em um cadastro público de negócios de {city}. Trabalho com materiais digitais simples para pequenos negócios. Posso te mandar uma ideia de divulgação sem compromisso?",
+        "first_message": f"Olá! Encontrei o {name} em uma fonte pública de negócios de {city}. Trabalho com materiais digitais simples para pequenos negócios. Posso te mandar uma ideia de divulgação sem compromisso?",
         "source": source,
     }
 
@@ -192,7 +253,6 @@ def _nominatim_fallback(niche, city, count, segment, seen):
 def _selectors_for_niche(niche, filters, radius_m, lat, lon):
     key = _norm(niche)
     if key in {"pizzaria", "pizza"}:
-        # Muitos cadastros não preenchem cuisine=pizza; cobre também nome e food:pizza.
         return [
             f'nwr["amenity"~"^(restaurant|fast_food)$"]["cuisine"~"pizza",i]["name"](around:{radius_m},{lat},{lon});',
             f'nwr["amenity"~"^(restaurant|fast_food)$"]["name"~"pizza|pizzaria",i](around:{radius_m},{lat},{lon});',
@@ -205,49 +265,147 @@ def _selectors_for_niche(niche, filters, radius_m, lat, lon):
     ]
 
 
-def fast_osm_discover(niche, city, count):
-    filters, segment = base.osm_rule_for_niche(niche)
-    lat, lon = _geocode_city(city)
+def _unwrap_ddg_url(href):
+    href = html.unescape(str(href or "").strip())
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    if "duckduckgo.com" in parsed.netloc and "uddg" in parse_qs(parsed.query):
+        return unquote(parse_qs(parsed.query)["uddg"][0])
+    if parsed.scheme in {"http", "https"} and "duckduckgo.com" not in parsed.netloc:
+        return href
+    return ""
 
-    radius_m = 10000 if " - " in str(city) else 16000
-    selectors = _selectors_for_niche(niche, filters, radius_m, lat, lon)
-    query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 80;"
-    elements = _overpass_once(query)
+
+def _clean_search_title(title):
+    value = re.sub(r"\s+", " ", html.unescape(str(title or ""))).strip()
+    if not value:
+        return ""
+
+    # Remove sufixos típicos de plataformas sem destruir nomes comerciais com hífen.
+    for sep in (" | ", " — ", " - "):
+        if sep in value:
+            left, right = value.rsplit(sep, 1)
+            if any(word in _norm(right) for word in PLATFORM_WORDS):
+                value = left.strip()
+
+    value = re.sub(r"\s*[|·]\s*(Instagram|Facebook|iFood|Tripadvisor).*?$", "", value, flags=re.I).strip()
+    return value[:120]
+
+
+def _web_search_fallback(niche, city, count, segment, seen):
+    query_text = f'"{niche}" "{_location_query(city)}"'
+    search_pages = [
+        ("https://html.duckduckgo.com/html/", {"q": query_text, "kl": "br-pt"}),
+        ("https://lite.duckduckgo.com/lite/", {"q": query_text, "kl": "br-pt"}),
+    ]
+
+    raw_links = []
+    for endpoint, payload in search_pages:
+        try:
+            page = _http_text(endpoint, payload, timeout=7)
+            parser = _LinkParser()
+            parser.feed(page)
+            raw_links = parser.links
+            if raw_links:
+                break
+        except Exception:
+            continue
 
     leads = []
-    seen = set()
+    seen_urls = set()
+    for href, title, classes in raw_links:
+        # No HTML completo, result__a reduz falsos positivos. No Lite aceitamos redirects externos.
+        url = _unwrap_ddg_url(href)
+        if not url or url in seen_urls:
+            continue
+        if classes and "result__a" not in classes and "result-link" not in classes:
+            continue
 
-    for element in elements:
-        tags = element.get("tags") or {}
-        name = str(tags.get("name") or "").strip()
+        name = _clean_search_title(title)
         normalized = _norm(name)
         if not _useful_name(name, niche, segment) or normalized in seen:
             continue
 
-        seen.add(normalized)
-        leads.append(_lead(
-            name,
-            segment,
-            city,
-            tags,
-            element.get("type", "node"),
-            element.get("id", ""),
-            "OpenStreetMap/Overpass",
-        ))
-        if len(leads) >= count:
-            return leads
+        host = _norm(urlparse(url).netloc)
+        if not host:
+            continue
+        if any(blocked in host for blocked in ("duckduckgo.com", "youtube.com", "wikipedia.org")):
+            continue
 
+        seen.add(normalized)
+        seen_urls.add(url)
+        leads.append({
+            "name": name,
+            "segment": segment,
+            "city": city,
+            "public_url": url,
+            "public_phone": "",
+            "public_instagram": url if "instagram.com" in host else "",
+            "address": "",
+            "signal": "Resultado público encontrado na web. Confirme o perfil, endereço e contato antes da abordagem.",
+            "opportunity": "Analisar rapidamente a presença digital pública e oferecer um pacote curto de conteúdo comercial.",
+            "offer": "Pacote Comercial Express: bio/posicionamento, 5 conteúdos, 5 legendas e mensagens de WhatsApp personalizadas.",
+            "first_message": f"Olá! Encontrei o {name} pesquisando negócios de {city}. Trabalho com materiais digitais simples para pequenos negócios. Posso te mandar uma ideia de divulgação sem compromisso?",
+            "source": "Busca web pública",
+        })
+        if len(leads) >= count:
+            break
+
+    return leads
+
+
+def discover_leads(niche, city, count):
+    filters, segment = base.osm_rule_for_niche(niche)
+    leads = []
+    seen = set()
+
+    # 1) OpenStreetMap/Overpass: estruturado, quando houver dados.
+    try:
+        lat, lon = _geocode_city(city)
+        radius_m = 10000 if " - " in str(city) else 16000
+        selectors = _selectors_for_niche(niche, filters, radius_m, lat, lon)
+        query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 80;"
+        elements = _overpass_once(query)
+
+        for element in elements:
+            tags = element.get("tags") or {}
+            name = str(tags.get("name") or "").strip()
+            normalized = _norm(name)
+            if not _useful_name(name, niche, segment) or normalized in seen:
+                continue
+            seen.add(normalized)
+            leads.append(_lead(
+                name,
+                segment,
+                city,
+                tags,
+                element.get("type", "node"),
+                element.get("id", ""),
+                "OpenStreetMap/Overpass",
+            ))
+            if len(leads) >= count:
+                return leads[:count]
+    except Exception:
+        pass
+
+    # 2) Nominatim: busca textual na mesma base.
     if len(leads) < count:
         leads.extend(_nominatim_fallback(niche, city, count - len(leads), segment, seen))
+    if len(leads) >= count:
+        return leads[:count]
 
+    # 3) Busca web pública: cobre negócios que não estão bem cadastrados no OSM.
+    leads.extend(_web_search_fallback(niche, city, count - len(leads), segment, seen))
     return leads[:count]
 
 
-# Usa a versão curta da prospecção.
-base.osm_discover = fast_osm_discover
+# Mantém compatibilidade com app.py.
+base.osm_discover = discover_leads
 
 
-# Substitui explicitamente a view da prospecção para garantir JSON legível em qualquer falha.
 def _prospect_view():
     data = request.get_json(silent=True) or {}
     niche = str(data.get("niche", "")).strip()
@@ -262,25 +420,25 @@ def _prospect_view():
         return jsonify({"ok": False, "error": "Informe nicho e cidade."}), 400
 
     try:
-        leads = fast_osm_discover(niche, city, count)
+        leads = discover_leads(niche, city, count)
         if not leads:
             return jsonify({
                 "ok": False,
-                "error": "A fonte pública respondeu, mas não encontrei negócios com nome próprio nessa busca. Tente escrever o local como: Vila Valqueire, Rio de Janeiro, RJ; ou experimente outro nicho.",
+                "error": "Não encontrei leads verificáveis nessa tentativa. A fonte de mapas e a busca web pública não retornaram nomes úteis. Tente um bairro próximo ou outro nicho.",
             }), 404
 
         return jsonify({
             "ok": True,
             "leads": leads,
             "sources": [{
-                "title": "© OpenStreetMap contributors",
+                "title": "Fontes públicas: OpenStreetMap e busca web",
                 "url": "https://www.openstreetmap.org/copyright",
             }],
         })
     except Exception as exc:
         return jsonify({
             "ok": False,
-            "error": f"Falha temporária na busca pública: {str(exc) or exc.__class__.__name__}",
+            "error": f"Falha temporária na prospecção: {str(exc) or exc.__class__.__name__}",
         }), 503
 
 
