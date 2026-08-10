@@ -125,11 +125,11 @@ def login():
         password = request.form.get("password", "")
         if ADMIN_PASSWORD and password == ADMIN_PASSWORD:
             session["zapvenda_admin"] = True
-            return redirect("/agente")
+            return send_from_directory(BASE_DIR, "agent.html")
         error = "Senha incorreta."
     else:
         error = ""
-    return f"""<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Entrar | ZapVenda Agent</title><style>body{{font-family:system-ui;background:#071d18;color:#eefcf7;display:grid;place-items:center;min-height:100vh;margin:0}}form{{width:min(92vw,390px);background:#0d2c24;padding:28px;border-radius:18px;box-shadow:0 20px 60px #0006}}input,button{{box-sizing:border-box;width:100%;padding:14px;border-radius:10px;border:0;margin-top:12px}}button{{background:#25d366;font-weight:800;cursor:pointer}}p{{color:#b9d6cc}}.err{{color:#ffb4ab}}</style></head><body><form method='post'><h1>ZapVenda Agent</h1><p>Painel privado da sua IA comercial.</p><input name='password' type='password' placeholder='Senha do painel' autocomplete='current-password' required><button type='submit'>Entrar</button><p class='err'>{error}</p></form></body></html>"""
+    return f"""<!doctype html><html lang='pt-BR'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Entrar | ZapVenda Agent</title><style>body{{font-family:system-ui;background:#071d18;color:#eefcf7;display:grid;place-items:center;min-height:100vh;margin:0}}form{{width:min(92vw,390px);background:#0d2c24;padding:28px;border-radius:18px;box-shadow:0 20px 60px #0006}}input,button{{box-sizing:border-box;width:100%;padding:14px;border-radius:10px;border:0;margin-top:12px}}button{{background:#25d366;font-weight:800;cursor:pointer}}p{{color:#b9d6cc}}.err{{color:#ffb4ab}}</style></head><body><form method='post' action='/entrar'><h1>ZapVenda Agent</h1><p>Painel privado da sua IA comercial.</p><input name='password' type='password' placeholder='Senha do painel' autocomplete='current-password' required><button type='submit'>Entrar</button><p class='err'>{error}</p></form></body></html>"""
 
 
 @app.get("/sair")
@@ -139,6 +139,7 @@ def logout():
 
 
 @app.get("/agente")
+@app.get("/painel")
 @protected
 def agent_page():
     return send_from_directory(BASE_DIR, "agent.html")
@@ -257,7 +258,7 @@ CONTEXTO:
 
 @app.get("/<path:filename>")
 def public_files(filename):
-    if filename.startswith("api/") or filename in {"agente", "entrar", "sair"}:
+    if filename.startswith("api/") or filename in {"agente", "painel", "entrar", "sair"}:
         return "Não encontrado", 404
     return send_from_directory(BASE_DIR, filename)
 
