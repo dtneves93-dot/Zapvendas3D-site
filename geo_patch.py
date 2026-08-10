@@ -9,9 +9,8 @@ def _parts(location):
 
 
 def _max_distance_km(location):
-    # Bairro + cidade + UF (ex.: Vila Valqueire, Rio de Janeiro, RJ)
-    # deve ser uma busca realmente local. Busca só por cidade pode ser mais ampla.
-    return 5.5 if len(_parts(location)) >= 3 else 16.0
+    # Bairro + cidade + UF: mantém foco local, mas inclui bairros vizinhos próximos.
+    return 8.0 if len(_parts(location)) >= 3 else 16.0
 
 
 def _coords(element):
@@ -41,13 +40,12 @@ def geographically_safe_discover(niche, city, count):
     leads = []
     seen = set()
 
-    # Para bairro, a posição geocodificada do próprio bairro vira o centro real da busca.
     try:
         lat, lon = server._geocode_city(city)
         max_km = _max_distance_km(city)
         radius_m = int(max_km * 1000)
         selectors = server._selectors_for_niche(niche, filters, radius_m, lat, lon)
-        query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 100;"
+        query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 120;"
         elements = server._overpass_once(query)
 
         ranked = []
@@ -87,8 +85,7 @@ def geographically_safe_discover(niche, city, count):
     except Exception:
         pass
 
-    # Em buscas de bairro, evitamos o fallback textual do Nominatim porque ele pode
-    # misturar negócios homônimos de outras regiões. Partimos direto para a busca web.
+    # Para bairro, evita Nominatim textual porque ele pode misturar homônimos distantes.
     if len(_parts(city)) < 3 and len(leads) < count:
         try:
             leads.extend(server._nominatim_fallback(niche, city, count - len(leads), segment, seen))
@@ -104,6 +101,5 @@ def geographically_safe_discover(niche, city, count):
     return leads[:count]
 
 
-# Substitui a função usada pela rota de prospecção e pelo app base.
 server.discover_leads = geographically_safe_discover
 server.base.osm_discover = geographically_safe_discover
