@@ -9,7 +9,6 @@ app = base.app
 
 OVERPASS_ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
     "https://overpass-api.de/api/interpreter",
 ]
 
@@ -37,7 +36,7 @@ def _useful_name(name, niche, segment):
     return normalized not in blocked
 
 
-def _http_json(url, data=None, timeout=8):
+def _http_json(url, data=None, timeout=6):
     headers = {
         "User-Agent": base.OSM_USER_AGENT,
         "Accept": "application/json",
@@ -48,6 +47,7 @@ def _http_json(url, data=None, timeout=8):
         body = urlencode(data).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = Request(url, data=body, headers=headers, method="POST")
+
     with urlopen(req, timeout=timeout) as response:
         raw = response.read().decode("utf-8")
     return json.loads(raw)
@@ -65,31 +65,30 @@ def _geocode_city(city):
         "countrycodes": "br",
     })
     try:
-        results = _http_json(f"{base.NOMINATIM_URL}/search?{params}", timeout=7)
+        rows = _http_json(f"{base.NOMINATIM_URL}/search?{params}", timeout=6)
     except Exception as exc:
         raise RuntimeError("Não consegui localizar a cidade agora. Tente novamente em alguns segundos.") from exc
 
-    if not results:
-        raise RuntimeError("Cidade não encontrada. Informe também o estado, por exemplo: Rio de Janeiro, RJ.")
+    if not rows:
+        raise RuntimeError("Cidade não encontrada. Informe cidade e estado, por exemplo: Rio de Janeiro, RJ.")
 
-    coords = (float(results[0]["lat"]), float(results[0]["lon"]))
+    coords = (float(rows[0]["lat"]), float(rows[0]["lon"]))
     base.CITY_CACHE[key] = coords
     return coords
 
 
-def _overpass(query):
-    last_error = None
+def _overpass_once(query):
     for endpoint in OVERPASS_ENDPOINTS:
         try:
-            payload = _http_json(endpoint, {"data": query}, timeout=8)
-            if isinstance(payload, dict) and "elements" in payload:
-                return payload
-        except Exception as exc:
-            last_error = exc
-    raise RuntimeError("Os servidores públicos de busca estão ocupados. Espere alguns segundos e tente novamente.") from last_error
+            payload = _http_json(endpoint, {"data": query}, timeout=6)
+            if isinstance(payload, dict):
+                return payload.get("elements", [])
+        except Exception:
+            continue
+    return []
 
 
-def _lead_from_osm(name, segment, city, tags, osm_type, osm_id, source):
+def _lead(name, segment, city, tags, osm_type="node", osm_id="", source="OpenStreetMap"):
     website = str(tags.get("contact:website") or tags.get("website") or "").strip()
     phone = str(tags.get("contact:phone") or tags.get("phone") or "").strip()
     instagram = str(tags.get("contact:instagram") or tags.get("instagram") or "").strip()
@@ -107,6 +106,7 @@ def _lead_from_osm(name, segment, city, tags, osm_type, osm_id, source):
             (phone, "telefone"),
         ) if value
     ]
+
     if channels:
         signal = "O cadastro público informa: " + ", ".join(channels) + "."
         opportunity = "Oferecer uma revisão da comunicação e um pacote curto de conteúdo comercial."
@@ -134,30 +134,32 @@ def _nominatim_fallback(niche, city, count, segment, seen):
     params = urlencode({
         "q": f"{niche}, {city}",
         "format": "jsonv2",
-        "limit": min(max(count * 4, 8), 20),
+        "limit": min(max(count * 4, 8), 16),
         "countrycodes": "br",
         "addressdetails": 1,
         "extratags": 1,
         "namedetails": 1,
     })
     try:
-        rows = _http_json(f"{base.NOMINATIM_URL}/search?{params}", timeout=8)
+        rows = _http_json(f"{base.NOMINATIM_URL}/search?{params}", timeout=6)
     except Exception:
         return []
 
     leads = []
     for row in rows or []:
-        name = ((row.get("namedetails") or {}).get("name") or row.get("display_name", "").split(",")[0]).strip()
+        namedetails = row.get("namedetails") or {}
+        name = str(namedetails.get("name") or row.get("display_name", "").split(",")[0]).strip()
         normalized = _norm(name)
         if not _useful_name(name, niche, segment) or normalized in seen:
             continue
+
         seen.add(normalized)
         extras = row.get("extratags") or {}
         tags = {
             "website": extras.get("website") or extras.get("contact:website") or "",
             "phone": extras.get("phone") or extras.get("contact:phone") or "",
         }
-        lead = _lead_from_osm(
+        item = _lead(
             name,
             segment,
             city,
@@ -166,10 +168,11 @@ def _nominatim_fallback(niche, city, count, segment, seen):
             row.get("osm_id") or "",
             "OpenStreetMap/Nominatim",
         )
-        lead["address"] = row.get("display_name", "")
-        leads.append(lead)
+        item["address"] = row.get("display_name", "")
+        leads.append(item)
         if len(leads) >= count:
             break
+
     return leads
 
 
@@ -177,46 +180,37 @@ def fast_osm_discover(niche, city, count):
     filters, segment = base.osm_rule_for_niche(niche)
     lat, lon = _geocode_city(city)
 
+    # Uma única busca radial. Evita acumular timeouts no Render gratuito.
+    radius_m = 16000
+    selectors = [
+        f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
+        for filter_text in filters
+    ]
+    query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 60;"
+    elements = _overpass_once(query)
+
     leads = []
     seen = set()
-    element_ids = set()
 
-    # Faz buscas progressivas e acumula resultados, em vez de parar no primeiro item encontrado.
-    for radius_m in (6000, 12000, 20000):
-        selectors = [
-            f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
-            for filter_text in filters
-        ]
-        query = "[out:json][timeout:7];(" + "".join(selectors) + ");out center tags 40;"
-        try:
-            elements = (_overpass(query) or {}).get("elements", [])
-        except RuntimeError:
-            elements = []
+    for element in elements:
+        tags = element.get("tags") or {}
+        name = str(tags.get("name") or "").strip()
+        normalized = _norm(name)
+        if not _useful_name(name, niche, segment) or normalized in seen:
+            continue
 
-        for element in elements:
-            unique_id = (element.get("type"), element.get("id"))
-            if unique_id in element_ids:
-                continue
-            element_ids.add(unique_id)
-
-            tags = element.get("tags") or {}
-            name = str(tags.get("name") or "").strip()
-            normalized = _norm(name)
-            if not _useful_name(name, niche, segment) or normalized in seen:
-                continue
-            seen.add(normalized)
-
-            leads.append(_lead_from_osm(
-                name,
-                segment,
-                city,
-                tags,
-                element.get("type", "node"),
-                element.get("id", ""),
-                "OpenStreetMap/Overpass",
-            ))
-            if len(leads) >= count:
-                return leads
+        seen.add(normalized)
+        leads.append(_lead(
+            name,
+            segment,
+            city,
+            tags,
+            element.get("type", "node"),
+            element.get("id", ""),
+            "OpenStreetMap/Overpass",
+        ))
+        if len(leads) >= count:
+            return leads
 
     if len(leads) < count:
         leads.extend(_nominatim_fallback(niche, city, count - len(leads), segment, seen))
@@ -224,5 +218,5 @@ def fast_osm_discover(niche, city, count):
     return leads[:count]
 
 
-# Substitui somente a prospecção. Todo o restante do agente continua em app.py.
+# Substitui apenas a prospecção; login, pipeline e IA continuam em app.py.
 base.osm_discover = fast_osm_discover
