@@ -55,13 +55,24 @@ def _http_json(url, data=None, timeout=6):
     return json.loads(raw)
 
 
+def _location_query(city):
+    text = str(city or "").strip()
+    # Permite "Rio de Janeiro, RJ - Vila Valqueire" e prioriza o bairro.
+    if " - " in text:
+        main_city, locality = [part.strip() for part in text.split(" - ", 1)]
+        if main_city and locality:
+            return f"{locality}, {main_city}"
+    return text
+
+
 def _geocode_city(city):
-    key = _norm(city)
+    query_text = _location_query(city)
+    key = _norm(query_text)
     if key in base.CITY_CACHE:
         return base.CITY_CACHE[key]
 
     params = urlencode({
-        "q": city,
+        "q": query_text,
         "format": "jsonv2",
         "limit": 1,
         "countrycodes": "br",
@@ -69,10 +80,10 @@ def _geocode_city(city):
     try:
         rows = _http_json(f"{base.NOMINATIM_URL}/search?{params}", timeout=6)
     except Exception as exc:
-        raise RuntimeError("Não consegui localizar a cidade agora. Tente novamente em alguns segundos.") from exc
+        raise RuntimeError("Não consegui localizar a cidade ou bairro agora. Tente novamente em alguns segundos.") from exc
 
     if not rows:
-        raise RuntimeError("Cidade não encontrada. Informe cidade e estado, por exemplo: Rio de Janeiro, RJ.")
+        raise RuntimeError("Local não encontrado. Tente: Vila Valqueire, Rio de Janeiro, RJ.")
 
     coords = (float(rows[0]["lat"]), float(rows[0]["lon"]))
     base.CITY_CACHE[key] = coords
@@ -134,7 +145,7 @@ def _lead(name, segment, city, tags, osm_type="node", osm_id="", source="OpenStr
 
 def _nominatim_fallback(niche, city, count, segment, seen):
     params = urlencode({
-        "q": f"{niche}, {city}",
+        "q": f"{niche}, {_location_query(city)}",
         "format": "jsonv2",
         "limit": min(max(count * 4, 8), 16),
         "countrycodes": "br",
@@ -178,16 +189,29 @@ def _nominatim_fallback(niche, city, count, segment, seen):
     return leads
 
 
+def _selectors_for_niche(niche, filters, radius_m, lat, lon):
+    key = _norm(niche)
+    if key in {"pizzaria", "pizza"}:
+        # Muitos cadastros não preenchem cuisine=pizza; cobre também nome e food:pizza.
+        return [
+            f'nwr["amenity"~"^(restaurant|fast_food)$"]["cuisine"~"pizza",i]["name"](around:{radius_m},{lat},{lon});',
+            f'nwr["amenity"~"^(restaurant|fast_food)$"]["name"~"pizza|pizzaria",i](around:{radius_m},{lat},{lon});',
+            f'nwr["food:pizza"="yes"]["name"](around:{radius_m},{lat},{lon});',
+        ]
+
+    return [
+        f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
+        for filter_text in filters
+    ]
+
+
 def fast_osm_discover(niche, city, count):
     filters, segment = base.osm_rule_for_niche(niche)
     lat, lon = _geocode_city(city)
 
-    radius_m = 16000
-    selectors = [
-        f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
-        for filter_text in filters
-    ]
-    query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 60;"
+    radius_m = 10000 if " - " in str(city) else 16000
+    selectors = _selectors_for_niche(niche, filters, radius_m, lat, lon)
+    query = "[out:json][timeout:6];(" + "".join(selectors) + ");out tags center 80;"
     elements = _overpass_once(query)
 
     leads = []
@@ -242,7 +266,7 @@ def _prospect_view():
         if not leads:
             return jsonify({
                 "ok": False,
-                "error": "A fonte pública respondeu, mas não encontrei negócios com nome próprio nessa busca. Tente informar também um bairro ou usar outro nicho.",
+                "error": "A fonte pública respondeu, mas não encontrei negócios com nome próprio nessa busca. Tente escrever o local como: Vila Valqueire, Rio de Janeiro, RJ; ou experimente outro nicho.",
             }), 404
 
         return jsonify({
