@@ -3,6 +3,8 @@ import unicodedata
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from flask import jsonify, request
+
 import app as base
 
 app = base.app
@@ -180,7 +182,6 @@ def fast_osm_discover(niche, city, count):
     filters, segment = base.osm_rule_for_niche(niche)
     lat, lon = _geocode_city(city)
 
-    # Uma única busca radial. Evita acumular timeouts no Render gratuito.
     radius_m = 16000
     selectors = [
         f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
@@ -218,5 +219,45 @@ def fast_osm_discover(niche, city, count):
     return leads[:count]
 
 
-# Substitui apenas a prospecção; login, pipeline e IA continuam em app.py.
+# Usa a versão curta da prospecção.
 base.osm_discover = fast_osm_discover
+
+
+# Substitui explicitamente a view da prospecção para garantir JSON legível em qualquer falha.
+def _prospect_view():
+    data = request.get_json(silent=True) or {}
+    niche = str(data.get("niche", "")).strip()
+    city = str(data.get("city", "")).strip()
+
+    try:
+        count = max(1, min(int(data.get("count", 5) or 5), 10))
+    except Exception:
+        count = 5
+
+    if not niche or not city:
+        return jsonify({"ok": False, "error": "Informe nicho e cidade."}), 400
+
+    try:
+        leads = fast_osm_discover(niche, city, count)
+        if not leads:
+            return jsonify({
+                "ok": False,
+                "error": "A fonte pública respondeu, mas não encontrei negócios com nome próprio nessa busca. Tente informar também um bairro ou usar outro nicho.",
+            }), 404
+
+        return jsonify({
+            "ok": True,
+            "leads": leads,
+            "sources": [{
+                "title": "© OpenStreetMap contributors",
+                "url": "https://www.openstreetmap.org/copyright",
+            }],
+        })
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "error": f"Falha temporária na busca pública: {str(exc) or exc.__class__.__name__}",
+        }), 503
+
+
+app.view_functions["api_prospect"] = base.protected(_prospect_view)
