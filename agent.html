@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#071d18">
+  <title>ZapVenda Agent | Painel Comercial</title>
+  <link rel="stylesheet" href="agent.css">
+</head>
+<body>
+  <header class="agent-topbar">
+    <div><b>ZapVenda Agent</b><span>microagência assistida por IA</span></div>
+    <nav><a href="/">Site</a><a href="/sair">Sair</a></nav>
+  </header>
+
+  <main class="shell">
+    <section class="hero-panel">
+      <div><span class="pill">MVP · APROVAÇÃO HUMANA</span><h1>Prospecte, venda, produza e entregue em um só painel.</h1><p>A IA faz o trabalho pesado. Você revisa antes de qualquer contato ou entrega.</p></div>
+      <div class="status" id="status">Conectando...</div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><span class="step">1</span><h2>Encontrar clientes</h2></div><small>Pesquisa pública + IA</small></div>
+      <div class="form-grid prospect-form">
+        <label>Nicho<input id="niche" placeholder="Ex.: pizzaria, barbearia, salão"></label>
+        <label>Cidade<input id="city" placeholder="Ex.: Rio de Janeiro, RJ"></label>
+        <label>Quantidade<select id="count"><option>3</option><option selected>5</option><option>8</option><option>10</option></select></label>
+        <button class="primary" id="prospectBtn">Buscar oportunidades</button>
+      </div>
+      <p class="hint">Use apenas contatos comerciais públicos e revise a abordagem antes de enviar.</p>
+      <div id="prospectResults" class="cards"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><span class="step">2</span><h2>Pipeline</h2></div><button id="clearBtn" class="ghost">Limpar dados locais</button></div>
+      <div class="pipeline" id="pipeline"></div>
+    </section>
+
+    <section class="panel workspace-panel">
+      <div class="panel-head"><div><span class="step">3</span><h2>Central de venda e produção</h2></div><small id="selectedLabel">Selecione um lead</small></div>
+      <div id="workspaceEmpty" class="empty">Escolha um lead no pipeline para trabalhar.</div>
+      <div id="workspace" hidden>
+        <div class="selected-summary" id="selectedSummary"></div>
+        <div class="action-grid">
+          <button data-action="qualify">Qualificar</button>
+          <button data-action="outreach">Criar abordagem</button>
+          <button data-action="offer">Montar oferta</button>
+          <button data-action="brief">Criar briefing</button>
+          <button data-action="product">Produzir material</button>
+          <button data-action="delivery">Mensagem de entrega</button>
+          <button data-action="followup">Follow-up</button>
+        </div>
+        <label>Mensagem recebida / informações extras<textarea id="conversation" rows="5" placeholder="Cole aqui a resposta do cliente, briefing, preço combinado ou qualquer detalhe novo."></textarea></label>
+        <button id="replyBtn" class="primary wide">Responder ao cliente</button>
+        <div class="output-wrap">
+          <div class="output-head"><b>Resultado da IA</b><div><button class="ghost" id="copyBtn">Copiar</button><button class="ghost" id="downloadBtn">Baixar .txt</button></div></div>
+          <pre id="output">O resultado aparecerá aqui.</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>ZapVenda Agent · primeira versão sem envio automático</footer>
+  <script src="agent.js"></script>
+</body>
+</html>
