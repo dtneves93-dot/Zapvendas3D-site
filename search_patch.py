@@ -14,6 +14,22 @@ GENERIC_PREFIXES = (
     "melhores ", "os melhores ", "lista de ", "guia de ", "onde comer",
     "pizzarias em ", "pizzaria em ", "barbearias em ", "barbearia em ",
     "restaurantes em ", "salões em ", "saloes em ", "encontre ",
+    "vagas de ", "vaga de ", "empregos em ", "emprego em ",
+)
+
+BLOCKED_DOMAINS = (
+    "indeed.com", "indeed.com.br", "br.indeed.com", "linkedin.com", "glassdoor.com",
+    "catho.com.br", "infojobs.com.br", "jooble.org", "simplyhired.com", "talent.com",
+    "youtube.com", "wikipedia.org", "tiktok.com", "pinterest.com",
+)
+
+BAD_TITLE_TERMS = (
+    " vagas ", " vaga ", " empregos ", " emprego ", " trabalhe conosco ",
+    " oportunidade de emprego ", " salários ", " salarios ", " currículo ", " curriculo ",
+)
+
+SOCIAL_POST_PATHS = (
+    "/p/", "/reel/", "/reels/", "/stories/", "/tv/", "/posts/", "/watch/", "/videos/",
 )
 
 
@@ -37,6 +53,11 @@ def _clean_title(title, city):
     if not value:
         return ""
 
+    # Instagram frequentemente devolve "Nome do negócio on Instagram: legenda...".
+    match = re.match(r"^(.*?)\s+on\s+Instagram\s*:", value, flags=re.I)
+    if match:
+        value = match.group(1).strip()
+
     # Remove apenas sufixos típicos de página/plataforma.
     for sep in (" | ", " — ", " - "):
         if sep in value:
@@ -48,7 +69,6 @@ def _clean_title(title, city):
             )):
                 value = left.strip()
 
-    # Não deixa a localização sozinha virar nome do lead.
     normalized = _norm(value)
     if any(normalized == _norm(part) for part in _location_parts(city)):
         return ""
@@ -71,15 +91,33 @@ def _niche_terms(niche):
     return special.get(key, [w for w in key.split() if len(w) >= 4] or [key])
 
 
+def _is_bad_url(url):
+    parsed = urlparse(url)
+    host = _norm(parsed.netloc)
+    path = parsed.path.lower()
+
+    if not host:
+        return True
+    if any(domain in host for domain in BLOCKED_DOMAINS):
+        return True
+
+    # Para Instagram/Facebook aceitamos perfil/página, mas não um post isolado.
+    if any(domain in host for domain in ("instagram.com", "facebook.com")):
+        if any(marker in path for marker in SOCIAL_POST_PATHS):
+            return True
+
+    return False
+
+
 def _looks_relevant(title, content, url, niche, city):
-    haystack = _norm(f"{title} {content} {url}")
+    haystack = _norm(f" {title} {content} {url} ")
+    if any(term in haystack for term in BAD_TITLE_TERMS):
+        return False
     if not any(_norm(term) in haystack for term in _niche_terms(niche)):
         return False
 
     location_terms = [_norm(p) for p in _location_parts(city) if len(_norm(p)) >= 4]
     if location_terms and not any(term in haystack for term in location_terms):
-        # Tavily pode retornar a página certa sem repetir o bairro no título; não reprova
-        # sites/perfis comerciais óbvios só por isso.
         host = _norm(urlparse(url).netloc)
         if not any(domain in host for domain in (
             "instagram.com", "facebook.com", "ifood.com.br", "deliverydireto.com.br",
@@ -89,21 +127,49 @@ def _looks_relevant(title, content, url, niche, city):
     return True
 
 
+def _business_quality(url, title):
+    parsed = urlparse(url)
+    host = _norm(parsed.netloc)
+    path = parsed.path.strip("/")
+    score = 0
+
+    if any(domain in host for domain in ("instagram.com", "facebook.com")):
+        # Perfil/página social é um contato útil para prospecção.
+        if path and "/" not in path:
+            score += 3
+        else:
+            score += 1
+    elif any(domain in host for domain in ("ifood.com.br", "deliverydireto.com.br")):
+        score += 2
+    else:
+        # Site próprio tende a ser o melhor resultado.
+        score += 4
+
+    normalized_title = _norm(title)
+    if any(word in normalized_title for word in ("oficial", "pizzaria", "pizza", "barbearia", "barber")):
+        score += 1
+    return score
+
+
 def _tavily_search(niche, city, count, segment, seen):
     if not TAVILY_API_KEY:
         return []
 
     location = server._location_query(city)
-    query = f'{niche} em {location} negócio local site Instagram Facebook iFood contato'
+    query = (
+        f'{niche} em {location} negócio local oficial '
+        'site Instagram Facebook iFood delivery telefone contato '
+        '-vagas -emprego -curriculo'
+    )
     payload = {
         "query": query,
         "search_depth": "basic",
         "topic": "general",
         "country": "brazil",
-        "max_results": min(max(count * 4, 8), 20),
+        "max_results": min(max(count * 6, 12), 20),
         "include_answer": False,
         "include_raw_content": False,
-        "exclude_domains": ["youtube.com", "wikipedia.org"],
+        "exclude_domains": list(BLOCKED_DOMAINS),
     }
     body = json.dumps(payload).encode("utf-8")
     req = Request(
@@ -128,8 +194,8 @@ def _tavily_search(niche, city, count, segment, seen):
         title = str(result.get("title") or "").strip()
         url = str(result.get("url") or "").strip()
         content = str(result.get("content") or "").strip()
-        score = float(result.get("score") or 0)
-        if not title or not url:
+        tavily_score = float(result.get("score") or 0)
+        if not title or not url or _is_bad_url(url):
             continue
 
         name = _clean_title(title, city)
@@ -144,13 +210,12 @@ def _tavily_search(niche, city, count, segment, seen):
             continue
 
         host = _norm(urlparse(url).netloc)
-        if not host or any(blocked in host for blocked in ("youtube.com", "wikipedia.org")):
-            continue
-        candidates.append((score, name, url, host))
+        quality = _business_quality(url, title)
+        candidates.append((quality, tavily_score, name, url, host))
 
-    candidates.sort(key=lambda row: row[0], reverse=True)
+    candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
     leads = []
-    for _, name, url, host in candidates:
+    for _, _, name, url, host in candidates:
         normalized = _norm(name)
         if normalized in seen:
             continue
