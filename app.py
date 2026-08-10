@@ -3,6 +3,7 @@ import os
 import re
 import unicodedata
 from functools import wraps
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -32,7 +33,13 @@ Regras obrigatórias:
 - Priorize ofertas simples, objetivas e fáceis de entregar digitalmente.
 """.strip()
 
-OSM_USER_AGENT = "ZapVendaAgent/0.2 (public-business-discovery)"
+OSM_USER_AGENT = "ZapVendaAgent/0.3 (+https://github.com/dtneves93-dot/Zapvendas3D-site)"
+NOMINATIM_URL = os.environ.get("NOMINATIM_URL", "https://nominatim.openstreetmap.org").rstrip("/")
+OVERPASS_ENDPOINTS = [
+    "https://overpass.private.coffee/api/interpreter",
+    "https://overpass-api.de/api/interpreter",
+]
+CITY_CACHE = {}
 
 NICHE_RULES = {
     "barbearia": (["[\"shop\"=\"hairdresser\"]"], "Barbearia"),
@@ -67,7 +74,7 @@ def normalize_text(value):
     return "".join(ch for ch in value if unicodedata.category(ch) != "Mn")
 
 
-def http_json(url, data=None, timeout=20):
+def http_json(url, data=None, timeout=18):
     headers = {"User-Agent": OSM_USER_AGENT, "Accept": "application/json"}
     if data is None:
         req = Request(url, headers=headers)
@@ -80,15 +87,24 @@ def http_json(url, data=None, timeout=20):
 
 
 def geocode_city(city):
-    params = urlencode({"q": city, "format": "jsonv2", "limit": 1, "countrycodes": "br"})
-    results = http_json(f"https://nominatim.openstreetmap.org/search?{params}")
+    cache_key = normalize_text(city)
+    if cache_key in CITY_CACHE:
+        return CITY_CACHE[cache_key]
+
+    params = urlencode({
+        "q": city,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "br",
+    })
+    results = http_json(f"{NOMINATIM_URL}/search?{params}", timeout=12)
     if not results:
         raise RuntimeError("Não consegui localizar essa cidade. Tente informar cidade e estado, por exemplo: Rio de Janeiro, RJ.")
-    bbox = results[0].get("boundingbox") or []
-    if len(bbox) != 4:
-        raise RuntimeError("A cidade foi encontrada, mas sem área geográfica utilizável.")
-    south, north, west, east = bbox
-    return float(south), float(west), float(north), float(east)
+
+    lat = float(results[0]["lat"])
+    lon = float(results[0]["lon"])
+    CITY_CACHE[cache_key] = (lat, lon)
+    return lat, lon
 
 
 def osm_rule_for_niche(niche):
@@ -102,15 +118,27 @@ def osm_rule_for_niche(niche):
     raise RuntimeError(f"Esse nicho ainda não está mapeado na busca gratuita. Por enquanto tente: {supported}.")
 
 
+def fetch_overpass(query):
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            return http_json(endpoint, {"data": query}, timeout=20)
+        except (HTTPError, URLError, TimeoutError, OSError):
+            continue
+    raise RuntimeError("Os servidores públicos de busca estão ocupados no momento. Espere alguns segundos e tente novamente.")
+
+
 def osm_discover(niche, city, count):
     filters, segment = osm_rule_for_niche(niche)
-    south, west, north, east = geocode_city(city)
-    bbox = f"{south},{west},{north},{east}"
-    selectors = []
-    for filter_text in filters:
-        selectors.append(f"nwr{filter_text}[\"name\"]({bbox});")
-    query = "[out:json][timeout:20];(" + "".join(selectors) + ");out center tags 60;"
-    payload = http_json("https://overpass-api.de/api/interpreter", {"data": query}, timeout=30)
+    lat, lon = geocode_city(city)
+
+    # Para poucos leads, uma busca radial é muito mais leve do que varrer o município inteiro.
+    radius_m = 18000
+    selectors = [
+        f"nwr{filter_text}[\"name\"](around:{radius_m},{lat},{lon});"
+        for filter_text in filters
+    ]
+    query = "[out:json][timeout:12];(" + "".join(selectors) + ");out center tags 30;"
+    payload = fetch_overpass(query)
     elements = payload.get("elements", [])
 
     leads = []
@@ -118,9 +146,10 @@ def osm_discover(niche, city, count):
     for element in elements:
         tags = element.get("tags") or {}
         name = str(tags.get("name") or "").strip()
-        if not name or normalize_text(name) in seen:
+        normalized_name = normalize_text(name)
+        if not name or normalized_name in seen:
             continue
-        seen.add(normalize_text(name))
+        seen.add(normalized_name)
 
         website = str(tags.get("contact:website") or tags.get("website") or "").strip()
         phone = str(tags.get("contact:phone") or tags.get("phone") or "").strip()
@@ -312,7 +341,7 @@ def api_prospect():
         return jsonify({
             "ok": True,
             "leads": leads,
-            "sources": [{"title": "OpenStreetMap", "url": "https://www.openstreetmap.org"}],
+            "sources": [{"title": "© OpenStreetMap contributors", "url": "https://www.openstreetmap.org/copyright"}],
         })
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
