@@ -20,6 +20,12 @@ Analise este prospecto usando SOMENTE os dados literalmente presentes no CONTEXT
 NÃO abra, leia, imagine ou descreva o conteúdo de URLs/perfis apenas porque uma URL foi fornecida.
 NÃO transforme uma hipótese em fato.
 
+Regras adicionais para FATO:
+- Se o contexto contém apenas uma URL do Instagram/Facebook, o único fato permitido é que uma página/perfil público foi encontrado naquela URL.
+- NÃO chame o perfil de ativo, atualizado, oficial, profissional, bem cuidado, frequente ou engajado sem evidência explícita no contexto.
+- NÃO diga que há botão de WhatsApp, link de agendamento, bio otimizada, identidade visual, frequência de posts, seguidores, avaliações ou agenda se isso não estiver escrito literalmente no contexto.
+- Se uma informação depende de abrir a URL para confirmar, trate como próximo passo verificável, nunca como fato atual.
+
 Retorne SOMENTE JSON válido com:
 - score: inteiro 0-100;
 - reasons: array de 2 a 4 strings. Cada item deve começar exatamente por "Fato:" ou "Inferência:";
@@ -37,7 +43,7 @@ CONTEXTO:
 """,
         "outreach": """
 Crie UMA mensagem inicial curta para este prospecto usando SOMENTE fatos literalmente presentes no CONTEXTO.
-Não diga que viu posts, frequência, identidade visual, avaliações, agenda, seguidores ou qualquer conteúdo do perfil se isso não estiver explicitamente descrito no contexto.
+Não diga que viu posts, frequência, identidade visual, avaliações, agenda, seguidores, atividade recente ou qualquer conteúdo do perfil se isso não estiver explicitamente descrito no contexto.
 Se houver pouca informação, use uma abordagem neutra e transparente: diga que encontrou o negócio em uma fonte pública e ofereça uma ideia/amostra sem compromisso.
 Não invente dor, não faça elogio genérico e não prometa resultado.
 Retorne apenas a mensagem.
