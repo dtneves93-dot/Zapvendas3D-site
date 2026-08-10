@@ -106,12 +106,16 @@ def run_ai(prompt, use_search=False):
     config_kwargs = {"system_instruction": SYSTEM_RULES}
     if use_search:
         config_kwargs["tools"] = [types.Tool(google_search=types.GoogleSearch())]
-    response = ai_client().models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(**config_kwargs),
-    )
-    return response
+
+    client = ai_client()
+    try:
+        return client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+    finally:
+        client.close()
 
 
 @app.get("/")
